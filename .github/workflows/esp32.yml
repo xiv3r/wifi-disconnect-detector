@@ -1,4 +1,4 @@
-name: Build ESP32 Plant Care Firmware
+name: Build ESP32 Firmware
 
 on:
   push:

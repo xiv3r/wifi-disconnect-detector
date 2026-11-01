@@ -1,7 +1,3 @@
-# Wiring Connection Guide — ESP32 Unified WiFi Manager
-
-Based on the firmware you provided, here's the complete wiring for your ESP32 project.
-
 ## Components Required
 
 | Qty | Component |

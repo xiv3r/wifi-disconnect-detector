@@ -5,7 +5,7 @@
 #include <esp_wifi.h>
 #include <esp_system.h>
 
-static const uint8_t PIN_LED         = 1;
+static const uint8_t PIN_LED         = 2;
 static const uint8_t PIN_BUZZER      = 25;
 static const uint8_t PIN_BOOT_BUTTON = 0;
 
@@ -76,6 +76,8 @@ static uint32_t g_staReapplyAt      = 0;
 static uint32_t g_staDownSince      = 0;
 static uint8_t  g_hwStaMac[6]       = {0,0,0,0,0,0};
 static bool     g_factoryResetPending = false;
+
+enum SaveResult { SAVE_NO_CHANGE = 0, SAVE_OK = 1, SAVE_FAIL = 2 };
 
 static uint32_t crc32(const uint8_t* data, size_t len) {
   uint32_t crc = 0xFFFFFFFFu;
@@ -165,7 +167,10 @@ static bool migrateV1(Config* c) {
 }
 
 static bool loadConfig() {
-  g_prefs.begin(NVS_NAMESPACE, false);
+  if (!g_prefs.begin(NVS_NAMESPACE, false)) {
+    applyDefaults(g_cfg);
+    return false;
+  }
   size_t got = g_prefs.getBytesLength(NVS_KEY);
   bool ok = false;
   bool migrated = false;
@@ -182,7 +187,11 @@ static bool loadConfig() {
                    g_cfg.ap_maxconn >= 1 && g_cfg.ap_maxconn <= 8 &&
                    g_cfg.ap_authmode <= 1 &&
                    g_cfg.sta_dhcp <= 1 &&
-                   g_cfg.sta_mac_custom <= 1) {
+                   g_cfg.sta_mac_custom <= 1 &&
+                   (g_cfg.sta_dhcp == 1 ||
+                    (g_cfg.sta_ip != 0 && g_cfg.sta_gw != 0 && g_cfg.sta_mask != 0 &&
+                     g_cfg.sta_ip != g_cfg.sta_gw &&
+                     ((g_cfg.sta_ip & g_cfg.sta_mask) == (g_cfg.sta_gw & g_cfg.sta_mask))))) {
           ok = true;
         }
       }
@@ -191,33 +200,35 @@ static bool loadConfig() {
   g_prefs.end();
   if (!ok) {
     applyDefaults(g_cfg);
-    g_prefs.begin(NVS_NAMESPACE, false);
-    g_prefs.putBytes(NVS_KEY, &g_cfg, sizeof(Config));
-    g_prefs.end();
+    if (g_prefs.begin(NVS_NAMESPACE, false)) {
+      g_prefs.putBytes(NVS_KEY, &g_cfg, sizeof(Config));
+      g_prefs.end();
+    }
   } else if (migrated) {
-    g_prefs.begin(NVS_NAMESPACE, false);
-    g_prefs.putBytes(NVS_KEY, &g_cfg, sizeof(Config));
-    g_prefs.end();
+    if (g_prefs.begin(NVS_NAMESPACE, false)) {
+      g_prefs.putBytes(NVS_KEY, &g_cfg, sizeof(Config));
+      g_prefs.end();
+    }
   }
   return ok;
 }
 
-static bool saveConfigIfChanged(const Config& candidate) {
+static SaveResult saveConfigIfChanged(const Config& candidate) {
   Config copy = candidate;
   copy.magic   = CONFIG_MAGIC;
   copy.version = CONFIG_VERSION;
   copy.crc     = configCrc(copy);
 
-  if (memcmp(&copy, &g_cfg, sizeof(Config)) == 0) return false;
+  if (memcmp(&copy, &g_cfg, sizeof(Config)) == 0) return SAVE_NO_CHANGE;
 
-  g_prefs.begin(NVS_NAMESPACE, false);
+  if (!g_prefs.begin(NVS_NAMESPACE, false)) return SAVE_FAIL;
   size_t w = g_prefs.putBytes(NVS_KEY, &copy, sizeof(Config));
   g_prefs.end();
   if (w == sizeof(Config)) {
     memcpy(&g_cfg, &copy, sizeof(Config));
-    return true;
+    return SAVE_OK;
   }
-  return false;
+  return SAVE_FAIL;
 }
 
 static uint32_t ipToU32(const String& s) {
@@ -302,7 +313,7 @@ static void doApplySTAConfig() {
                    g_cfg.sta_mask >> 8,  g_cfg.sta_mask);
     WiFi.config(ip, gw, mask);
   } else {
-    WiFi.config(IPAddress(0,0,0,0), IPAddress(0,0,0,0), IPAddress(0,0,0,0));
+    WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
   }
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
@@ -312,13 +323,15 @@ static void doApplySTAConfig() {
 }
 
 static void factoryResetWipe() {
-  g_prefs.begin(NVS_NAMESPACE, false);
-  g_prefs.clear();
-  g_prefs.end();
+  if (g_prefs.begin(NVS_NAMESPACE, false)) {
+    g_prefs.clear();
+    g_prefs.end();
+  }
   applyDefaults(g_cfg);
-  g_prefs.begin(NVS_NAMESPACE, false);
-  g_prefs.putBytes(NVS_KEY, &g_cfg, sizeof(Config));
-  g_prefs.end();
+  if (g_prefs.begin(NVS_NAMESPACE, false)) {
+    g_prefs.putBytes(NVS_KEY, &g_cfg, sizeof(Config));
+    g_prefs.end();
+  }
 }
 
 static void factoryResetApply() {
@@ -436,7 +449,7 @@ static String pageSTA(const String& msg, bool err) {
                              : "<div class='ok'>"  + htmlEsc(msg.c_str()) + "</div>";
   h += "<form method='POST' action='/sta' autocomplete='off'>";
   h += "<label>SSID</label><input name='ssid' maxlength='32' value='" + htmlEsc(g_cfg.sta_ssid) + "'>";
-  h += "<label>Password (blank = unchanged)</label><input type='password' name='pass' maxlength='64' value='' autocomplete='new-password' autocapitalize='off' spellcheck='false'>";
+  h += "<label>Password (blank = unchanged; type --OPEN-- to clear for open network)</label><input type='password' name='pass' maxlength='64' value='' autocomplete='new-password' autocapitalize='off' spellcheck='false'>";
   h += "<label>Hostname</label><input name='host' maxlength='32' value='" + htmlEsc(g_cfg.sta_hostname) + "'>";
   h += "<label>IP mode</label><select name='dhcp'>";
   h += "<option value='1'" + String(g_cfg.sta_dhcp ? " selected" : "") + ">DHCP</option>";
@@ -454,6 +467,16 @@ static String pageSTA(const String& msg, bool err) {
            g_cfg.sta_mac[3], g_cfg.sta_mac[4], g_cfg.sta_mac[5]);
   h += "<input name='mac' value='";
   if (g_cfg.sta_mac_custom) h += macStr;
+  h += "' placeholder='";
+  bool hwMacValid = (g_hwStaMac[0] || g_hwStaMac[1] || g_hwStaMac[2] ||
+                     g_hwStaMac[3] || g_hwStaMac[4] || g_hwStaMac[5]);
+  if (hwMacValid) {
+    char hwMacStr[18] = {0};
+    snprintf(hwMacStr, sizeof(hwMacStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             g_hwStaMac[0], g_hwStaMac[1], g_hwStaMac[2],
+             g_hwStaMac[3], g_hwStaMac[4], g_hwStaMac[5]);
+    h += hwMacStr;
+  }
   h += "'>";
   h += "<button type='submit'>Save &amp; Reconnect</button></form>";
   h += HTML_FOOT;
@@ -500,7 +523,8 @@ static void handleAPPost() {
   if (ssid.length() == 0 || ssid.length() > 32) err = "SSID must be 1..32 chars";
   else if (auth == 1 && effectivePass.length() > 0 && effectivePass.length() < 8) err = "WPA2 password must be >=8 chars";
   else if (auth == 1 && effectivePass.length() == 0) err = "WPA2 requires password";
-  else if (effectivePass.length() > 64) err = "Password too long";
+  else if (auth == 1 && effectivePass.length() > 63) err = "WPA2 password must be <=63 chars";
+  else if (auth == 0 && effectivePass.length() > 64) err = "Password too long";
   else if (ch < 1 || ch > 13) err = "Channel must be 1..13";
   else if (txp < 5 || txp > 20) err = "TX power must be 5..20 dBm";
   else if (mc < 1 || mc > 8) err = "Max clients must be 1..8";
@@ -518,7 +542,12 @@ static void handleAPPost() {
   candidate.ap_hidden   = (uint8_t)(hid ? 1 : 0);
   candidate.ap_authmode = (uint8_t)(auth ? 1 : 0);
 
-  if (!saveConfigIfChanged(candidate)) {
+  SaveResult sr = saveConfigIfChanged(candidate);
+  if (sr == SAVE_FAIL) {
+    g_server.send(500, "text/html", pageAP("Save failed (NVS error).", true));
+    return;
+  }
+  if (sr == SAVE_NO_CHANGE) {
     g_server.send(200, "text/html", pageAP("No changes.", false));
     return;
   }
@@ -543,11 +572,14 @@ static void handleSTAPost() {
   String macS = g_server.arg("mac");
 
   bool passBlank = (pass.length() == 0);
-  String effectivePass = passBlank ? String(g_cfg.sta_pass) : pass;
+  bool passClear = (pass == "--OPEN--");
+  String effectivePass = passBlank ? String(g_cfg.sta_pass)
+                       : passClear ? String("")
+                       : pass;
 
   String err;
   if (ssid.length() > 32) err = "SSID too long";
-  else if (effectivePass.length() > 64) err = "Password too long";
+  else if (effectivePass.length() > 63) err = "Password must be <=63 chars";
   else if (host.length() > 32) err = "Hostname too long";
   else if (host.length() && host.indexOf(' ') >= 0) err = "Hostname has spaces";
 
@@ -573,9 +605,17 @@ static void handleSTAPost() {
                &v[0],&v[1],&v[2],&v[3],&v[4],&v[5]) != 6) {
       err = "MAC must be XX:XX:XX:XX:XX:XX";
     } else {
-      for (int i = 0; i < 6; i++) mac[i] = (uint8_t)v[i];
-      if (!validCustomMac(mac)) err = "MAC must be unicast and non-zero";
-      else useMac = true;
+      bool macRangeOk = true;
+      for (int i = 0; i < 6; i++) {
+        if (v[i] < 0 || v[i] > 255) { macRangeOk = false; break; }
+      }
+      if (!macRangeOk) {
+        err = "MAC octet out of range (00..FF)";
+      } else {
+        for (int i = 0; i < 6; i++) mac[i] = (uint8_t)v[i];
+        if (!validCustomMac(mac)) err = "MAC must be unicast and non-zero";
+        else useMac = true;
+      }
     }
   }
 
@@ -594,7 +634,12 @@ static void handleSTAPost() {
   memcpy(candidate.sta_mac, mac, 6);
   candidate.sta_mac_custom = useMac ? 1 : 0;
 
-  if (!saveConfigIfChanged(candidate)) {
+  SaveResult sr = saveConfigIfChanged(candidate);
+  if (sr == SAVE_FAIL) {
+    g_server.send(500, "text/html", pageSTA("Save failed (NVS error).", true));
+    return;
+  }
+  if (sr == SAVE_NO_CHANGE) {
     g_server.send(200, "text/html", pageSTA("No changes.", false));
     return;
   }
@@ -759,6 +804,10 @@ void loop() {
       g_dnsStarted = false;
     }
     applyAP();
+    if (strlen(g_cfg.sta_ssid) > 0) {
+      g_pendingStaApply = true;
+      g_staApplyAt = millis() + 200;
+    }
   }
 
   if (g_pendingStaApply && (int32_t)(millis() - g_staApplyAt) >= 0) {
@@ -773,4 +822,3 @@ void loop() {
 
   yield();
 }
-
